@@ -7712,6 +7712,18 @@
                 "supportBlockMandatory": false,
                 "flammable": false,
                 "presetIndex": 2
+            },
+            "3": {
+                "displayName": "Potent Sulfur",
+                "validVersions": {
+                    "1.21.5": {
+                        "NBTName": "potent_sulfur",
+                        "NBTArgs": {}
+                    }
+                },
+                "supportBlockMandatory": false,
+                "flammable": false,
+                "presetIndex": 3
             }
         },
         "mapdatId": 30,
