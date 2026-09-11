@@ -685,8 +685,6 @@ function getMapartImageDataAndMaterials() {
       continue; // fully transparent mapdat pixel: no block, no material
     }
     const closestColourSetIdAndTone = paletteEntries[paletteIndex];
-    {
-
       if (canvasImageData.data[indexA] !== 0) {
         // support-block count: mapdat can skip this
         if (optionValue_modeNBTOrMapdat === MapModes.SCHEMATIC_NBT.uniqueId) {
@@ -856,7 +854,6 @@ function getMapartImageDataAndMaterials() {
       if (canvasImageData.data[indexA] === 0 && selectedBlocks[alphaColorIdx] > -1) {
         maps[whichMap_y][whichMap_x].materials[alphaColorIdx] += 1;
       }
-    }
   }
 }
 
