@@ -26,7 +26,12 @@ var optionValue_dithering_propagation_blue;
 
 var colourSetsToUse = []; // colourSetIds and shades to use in map
 var exactColourCache = new Map(); // for mapping RGB that exactly matches in coloursJSON to colourSetId and tone
-var colourCache = new Map(); // cache for reusing colours in identical pixels
+var nearestColourCache = new Map(); // RGB -> index of the closest palette entry
+var nearestPairCache = new Map(); // RGB -> the closest two palette entries, which ordered dithering picks between
+var paletteEntries = []; // flat [{colourSetId, tone, rgb}] view of colourSetsToUse
+var paletteCoords = null; // Float64Array, 3 colour-space coordinates per palette entry
+var paletteDitherCoords = null; // Float64Array, 3 dither-space coordinates per palette entry
+var pixelPaletteIndex = null; // Int32Array, chosen palette entry per pixel (-1 = transparent)
 var labCache = new Map();
 var lab50Cache = new Map();
 var lab65Cache = new Map();
@@ -43,13 +48,13 @@ let alphaColorIdx = 61;
 */
 
 // rgb2lab conversion based on the one from redstonehelper's program
-function rgb2lab(rgb) {
-  let val = (rgb[0] << 16) + (rgb[1] << 8) + rgb[2];
-  if (labCache.has(val)) return labCache.get(val);
-
-  let r1 = rgb[0] / 255.0;
-  let g1 = rgb[1] / 255.0;
-  let b1 = rgb[2] / 255.0;
+// Note the L* axis comes out scaled by 2.55, i.e. on a 0-255 range rather than
+// 0-100, so lightness carries ~2.55x the weight of a* and b* in the metric.
+// That is deliberate and long-standing: for mapart, lightness is height.
+function rgb2labF(r, g, b) {
+  let r1 = r / 255.0;
+  let g1 = g / 255.0;
+  let b1 = b / 255.0;
 
   r1 = 0.04045 >= r1 ? (r1 /= 12.0) : Math.pow((r1 + 0.055) / 1.055, 2.4);
   g1 = 0.04045 >= g1 ? (g1 /= 12.0) : Math.pow((g1 + 0.055) / 1.055, 2.4);
@@ -61,9 +66,15 @@ function rgb2lab(rgb) {
     m = 500.0 * ((0.008856452 < f ? Math.pow(f, 1 / 3) : (903.2963 * f + 16.0) / 116.0) - l),
     n = 200.0 * (l - (0.008856452 < k ? Math.pow(k, 1 / 3) : (903.2963 * k + 16.0) / 116.0));
 
-  rgb = [2.55 * (116.0 * l - 16.0) + 0.5, m + 0.5, n + 0.5];
-  labCache.set(val, rgb);
-  return rgb;
+  return [2.55 * (116.0 * l - 16.0) + 0.5, m + 0.5, n + 0.5];
+}
+
+function rgb2lab(rgb) {
+  let val = (rgb[0] << 16) + (rgb[1] << 8) + rgb[2];
+  if (labCache.has(val)) return labCache.get(val);
+  const lab = rgb2labF(rgb[0], rgb[1], rgb[2]);
+  labCache.set(val, lab);
+  return lab;
 }
 
 //Code based on culori.js - https://culorijs.org/
@@ -72,13 +83,11 @@ function labF(y) {
   return (0.00885645167903563081717167575546 < y ? Math.cbrt(y) : (903.2962962962962962962962962963 * y + 16) / 116);
 }
 
-function rgb2lab50(rgb) {
-  let val = (rgb[0] << 16) + (rgb[1] << 8) + rgb[2];
-  if (lab50Cache.has(val)) return lab50Cache.get(val);
-
-  let r1 = rgb[0] / 255.0;
-  let g1 = rgb[1] / 255.0;
-  let b1 = rgb[2] / 255.0;
+function rgb2lab50F(red, green, blue) {
+  // sRGB must be linearised before the XYZ matrix is applied, otherwise this is not L*a*b* at all
+  let r1 = linearized(red);
+  let g1 = linearized(green);
+  let b1 = linearized(blue);
 
   let x = (0.436065742824811 * r1 + 0.3851514688337912 * g1 + 0.14307845442264197 * b1) / 0.96429567642956764295676429567643,
     y = 0.22249319175623702 * r1 + 0.7168870538238823 * g1 + 0.06061979053616537 * b1,
@@ -96,19 +105,23 @@ function rgb2lab50(rgb) {
     b = 200 * (f1 - f2);
   }
 
-  let lab50 = [l, a, b];
+  return [l, a, b];
+}
+
+function rgb2lab50(rgb) {
+  let val = (rgb[0] << 16) + (rgb[1] << 8) + rgb[2];
+  if (lab50Cache.has(val)) return lab50Cache.get(val);
+  const lab50 = rgb2lab50F(rgb[0], rgb[1], rgb[2]);
   lab50Cache.set(val, lab50);
   return lab50;
 }
 
 //Code based on culori.js - https://culorijs.org/
-function rgb2lab65(rgb) {
-  let val = (rgb[0] << 16) + (rgb[1] << 8) + rgb[2];
-  if (lab65Cache.has(val)) return lab65Cache.get(val);
-
-  let r1 = rgb[0] / 255.0;
-  let g1 = rgb[1] / 255.0;
-  let b1 = rgb[2] / 255.0;
+function rgb2lab65F(red, green, blue) {
+  // sRGB must be linearised before the XYZ matrix is applied, otherwise this is not L*a*b* at all
+  let r1 = linearized(red);
+  let g1 = linearized(green);
+  let b1 = linearized(blue);
 
   let x = (0.4123907992659593 * r1 + 0.357584339383878 * g1 + 0.1804807884018343 * b1) / 0.95045592705167173252279635258359,
     y = 0.2126390058715102 * r1 + 0.715168678767756 * g1 + 0.0721923153607337 * b1,
@@ -126,7 +139,13 @@ function rgb2lab65(rgb) {
     b = 200 * (f1 - f2);
   }
 
-  let lab65 = [l, a, b];
+  return [l, a, b];
+}
+
+function rgb2lab65(rgb) {
+  let val = (rgb[0] << 16) + (rgb[1] << 8) + rgb[2];
+  if (lab65Cache.has(val)) return lab65Cache.get(val);
+  const lab65 = rgb2lab65F(rgb[0], rgb[1], rgb[2]);
   lab65Cache.set(val, lab65);
   return lab65;
 }
@@ -163,11 +182,8 @@ function rgb2xyz(rgb) {
   return [x, y, z]; // NOT multiplied by 100.0
 }
 
-function rgb2hct(rgb) {
-  const val = (rgb[0] << 16) + (rgb[1] << 8) + rgb[2];
-  if (hctCache.has(val)) return hctCache.get(val);
-
-  const xyz = rgb2xyz(rgb);
+function rgb2hctF(red, green, blue) {
+  const xyz = rgb2xyz([red, green, blue]);
   const x = xyz[0];
   const y = xyz[1];
   const z = xyz[2];
@@ -208,221 +224,357 @@ function rgb2hct(rgb) {
   const bstar = mstar * Math.sin(hueRadians);
   const Lstar = 116.0 * labF(y) - 16.0;
 
-  const hct = [Lstar, astar, bstar];
+  return [Lstar, astar, bstar];
+}
+
+function rgb2hct(rgb) {
+  const val = (rgb[0] << 16) + (rgb[1] << 8) + rgb[2];
+  if (hctCache.has(val)) return hctCache.get(val);
+  const hct = rgb2hctF(rgb[0], rgb[1], rgb[2]);
   hctCache.set(val, hct);
   return hct;
 }
 
-function squaredEuclideanMetricColours(pixel1, pixel2) {
-  const chosenColourMethod =
-    ColourMethods[Object.keys(ColourMethods).find((colourMethodKey) => ColourMethods[colourMethodKey].uniqueId === optionValue_betterColour)];
+// ---------------------------------------------------------------------------
+// Colour-space handling
+//
+// Every colour method used here maps an sRGB triplet onto a *rectangular*
+// 3-vector (L*a*b*, a scaled L*a*b*, HCT's L*/a*/b* form, or plain RGB).
+// That matters for dithering: error diffusion needs a space in which
+// differences are meaningful and additive, so we carry the dither error in
+// exactly the same space the colour metric is defined on.
+//
+// This mirrors SlopeCraft's imageConvert.hpp, which keeps its `dither_c3`
+// accumulator in the working colour space rather than in 8-bit sRGB.
+// ---------------------------------------------------------------------------
 
-  if (chosenColourMethod.uniqueId === ColourMethods.MapartCraftDefault.uniqueId) {
-    //return deltaE(rgb2lab(pixel1),rgb2lab(pixel2))
-    pixel1 = rgb2lab(pixel1);
-    pixel2 = rgb2lab(pixel2);
-    const L = pixel1[0] - pixel2[0];
-    const a = pixel1[1] - pixel2[1];
-    const b = pixel1[2] - pixel2[2];
-    return L * L + a * a + b * b;
-  }
-  else if (chosenColourMethod.uniqueId === ColourMethods.Cie76_Lab50.uniqueId ||
-    chosenColourMethod.uniqueId === ColourMethods.Cie76_Lab65.uniqueId ||
-    chosenColourMethod.uniqueId === ColourMethods.Hct.uniqueId) {
-    if (chosenColourMethod.uniqueId === ColourMethods.Cie76_Lab50.uniqueId) {
-      pixel1 = rgb2lab50(pixel1);
-      pixel2 = rgb2lab50(pixel2);
-    }
-    else if (chosenColourMethod.uniqueId === ColourMethods.Cie76_Lab65.uniqueId) {
-      pixel1 = rgb2lab65(pixel1);
-      pixel2 = rgb2lab65(pixel2);
-    }
-    else {
-      pixel1 = rgb2hct(pixel1);
-      pixel2 = rgb2hct(pixel2);
-    }
-    const L = pixel1[0] - pixel2[0];
-    const a = pixel1[1] - pixel2[1];
-    const b = pixel1[2] - pixel2[2];
-    return L * L + a * a + b * b;
-  }
-  else if (chosenColourMethod.uniqueId === ColourMethods.Ciede2000_Lab50.uniqueId ||
-      chosenColourMethod.uniqueId === ColourMethods.Ciede2000_Lab65.uniqueId) {
-    //Code based on culori.js - https://culorijs.org/
+function isCiede2000Method(methodUniqueId) {
+  return methodUniqueId === ColourMethods.Ciede2000_Lab50.uniqueId || methodUniqueId === ColourMethods.Ciede2000_Lab65.uniqueId;
+}
 
-    if (chosenColourMethod.uniqueId === ColourMethods.Ciede2000_Lab50.uniqueId) {
-      pixel1 = rgb2lab50(pixel1);
-      pixel2 = rgb2lab50(pixel2);
-    }
-    else {
-      pixel1 = rgb2lab65(pixel1);
-      pixel2 = rgb2lab65(pixel2);
-    }
-
-    let lStd = pixel1[0];
-    let aStd = pixel1[1];
-    let bStd = pixel1[2];
-    let cStd = Math.sqrt(aStd * aStd + bStd * bStd);
-
-    let lSmp = pixel2[0];
-    let aSmp = pixel2[1];
-    let bSmp = pixel2[2];
-    let cSmp = Math.sqrt(aSmp * aSmp + bSmp * bSmp);
-    let cAvg = (cStd + cSmp) / 2;
-
-    let cAvgPow7 = Math.pow(cAvg, 7);
-    let G =
-      0.5 *
-      (1 -
-        Math.sqrt(
-          cAvgPow7 / (cAvgPow7 + Math.pow(25, 7))
-        ));
-
-    let apStd = aStd * (1 + G);
-    let apSmp = aSmp * (1 + G);
-
-    let cpStd = Math.sqrt(apStd * apStd + bStd * bStd);
-    let cpSmp = Math.sqrt(apSmp * apSmp + bSmp * bSmp);
-
-    let hpStd =
-      Math.abs(apStd) + Math.abs(bStd) === 0
-        ? 0
-        : Math.atan2(bStd, apStd);
-    hpStd += (hpStd < 0) * 2 * Math.PI;
-
-    let hpSmp =
-      Math.abs(apSmp) + Math.abs(bSmp) === 0
-        ? 0
-        : Math.atan2(bSmp, apSmp);
-    hpSmp += (hpSmp < 0) * 2 * Math.PI;
-
-    let dL = lSmp - lStd;
-    let dC = cpSmp - cpStd;
-
-    let cpStdtimescpSmpZero = (cpStd === 0 && cpSmp === 0);
-    let dhp = cpStdtimescpSmpZero ? 0 : hpSmp - hpStd;
-    dhp -= (dhp > Math.PI) * 2 * Math.PI;
-    dhp += (dhp < -Math.PI) * 2 * Math.PI;
-
-    let dH = 2 * Math.sqrt(cpStd * cpSmp) * Math.sin(dhp / 2);
-
-    let Lp = (lStd + lSmp) / 2;
-    let Cp = (cpStd + cpSmp) / 2;
-
-    let hp;
-    if (cpStdtimescpSmpZero) {
-      hp = hpStd + hpSmp;
-    } else {
-      hp = (hpStd + hpSmp) / 2;
-      hp -= (Math.abs(hpStd - hpSmp) > Math.PI) * Math.PI;
-      hp += (hp < 0) * 2 * Math.PI;
-    }
-
-    let Lpminus50 = Lp - 50;
-    let Lpm50 = Lpminus50 * Lpminus50;
-    let T =
-      1 -
-      0.17 * Math.cos(hp - Math.PI / 6) +
-      0.24 * Math.cos(2 * hp) +
-      0.32 * Math.cos(3 * hp + Math.PI / 30) -
-      0.2 * Math.cos(4 * hp - (63 * Math.PI) / 180);
-
-    let Sl = 1 + (0.015 * Lpm50) / Math.sqrt(20 + Lpm50);
-    let Sc = 1 + 0.045 * Cp;
-    let Sh = 1 + 0.015 * Cp * T;
-
-    let deltaTheta =
-      ((30 * Math.PI) / 180) *
-      Math.exp(-1 * Math.pow(((180 / Math.PI) * hp - 275) / 25, 2));
-    let Rc =
-      2 *
-      Math.sqrt(Math.pow(Cp, 7) / (Math.pow(Cp, 7) + Math.pow(25, 7)));
-
-    let Rt = -1 * Math.sin(2 * deltaTheta) * Rc;
-
-    let dLdivSl = dL / Sl;
-    let dCdivSc = dC / Sc;
-    let dHdivSh = dH / Sh;
-    return dLdivSl * dLdivSl + dCdivSc * dCdivSc + dHdivSh * dHdivSh +
-        (((Rt * dC) / Sc) * dH) / Sh;
-  }
-  else {
-    const r = pixel1[0] - pixel2[0];
-    const g = pixel1[1] - pixel2[1];
-    const b = pixel1[2] - pixel2[2];
-    return r * r + g * g + b * b;
+// Maps an 8-bit RGB triplet into the coordinates of the currently selected colour method.
+function colourToSpace(rgb) {
+  switch (optionValue_betterColour) {
+    case ColourMethods.MapartCraftDefault.uniqueId:
+      return rgb2lab(rgb);
+    case ColourMethods.Cie76_Lab50.uniqueId:
+    case ColourMethods.Ciede2000_Lab50.uniqueId:
+      return rgb2lab50(rgb);
+    case ColourMethods.Cie76_Lab65.uniqueId:
+    case ColourMethods.Ciede2000_Lab65.uniqueId:
+      return rgb2lab65(rgb);
+    case ColourMethods.Hct.uniqueId:
+      return rgb2hct(rgb);
+    default:
+      // Euclidian, and the GA converter's final pass
+      return [rgb[0], rgb[1], rgb[2]];
   }
 }
 
-function findClosestColourSetIdAndToneAndRGBTo(pixelRGB) {
-  let RGBBinary = (pixelRGB[0] << 16) + (pixelRGB[1] << 8) + pixelRGB[2]; // injective mapping RGB to concatenated binaries
-  if (colourCache.has(RGBBinary)) {
-    return colourCache.get(RGBBinary);
-  } else {
-    let shortestDistance = 9999999;
-    let closestPixel;
-
-    colourSetsToUse.forEach((colourSet) => {
-      Object.keys(colourSet.tonesRGB).forEach((toneKey) => {
-        const toneRGB = colourSet.tonesRGB[toneKey];
-        let squareDistance = squaredEuclideanMetricColours(toneRGB, pixelRGB);
-        if (squareDistance < shortestDistance) {
-          shortestDistance = squareDistance;
-          closestPixel = {
-            colourSetId: colourSet.colourSetId,
-            tone: toneKey,
-          };
-        }
-      });
-    });
-    colourCache.set(RGBBinary, closestPixel);
-    return closestPixel;
+// As colourToSpace, but for a continuous sRGB triplet: no cache, no rounding.
+function colourToSpaceF(r, g, b) {
+  switch (optionValue_betterColour) {
+    case ColourMethods.MapartCraftDefault.uniqueId:
+      return rgb2labF(r, g, b);
+    case ColourMethods.Cie76_Lab50.uniqueId:
+    case ColourMethods.Ciede2000_Lab50.uniqueId:
+      return rgb2lab50F(r, g, b);
+    case ColourMethods.Cie76_Lab65.uniqueId:
+    case ColourMethods.Ciede2000_Lab65.uniqueId:
+      return rgb2lab65F(r, g, b);
+    case ColourMethods.Hct.uniqueId:
+      return rgb2hctF(r, g, b);
+    default:
+      return [r, g, b];
   }
 }
 
-function findClosest2ColourSetIdAndToneAndRGBTo(pixelRGB) {
-  let RGBBinary = (pixelRGB[0] << 16) + (pixelRGB[1] << 8) + pixelRGB[2];
-  if (colourCache.has(RGBBinary)) {
-    return colourCache.get(RGBBinary);
-  } else {
-    let shortestDistance1 = 9999999;
-    let shortestDistance2 = 9999999;
-    let closestPixel1 = { colourSetId: null, tone: null }; // best colour
-    let closestPixel2 = { colourSetId: null, tone: null }; // second best colour
+// ---------------------------------------------------------------------------
+// Dither space
+//
+// The space the diffused quantisation error accumulates in. It is deliberately
+// NOT the colour metric's space: error diffusion works by preserving the local
+// *mean*, and a mean is only preserved under a linear map. Accumulating error
+// in L*a*b* (as SlopeCraft's imageConvert.hpp does, carrying `dither_c3` in
+// whichever space the metric uses) preserves the mean of L*a*b* instead, which
+// on smooth mid-tone ramps shifts the mean the viewer actually sees, because
+// L* is a cube root of luminance.
+//
+// Light is what physically averages when a mapart is seen from a distance or
+// downscaled, so the error is accumulated in linear light. Choosing the
+// nearest colour stays fully perceptual: the accumulated value is converted
+// back to sRGB and handed to the selected colour metric.
+// ---------------------------------------------------------------------------
 
-    colourSetsToUse.forEach((colourSet) => {
-      Object.keys(colourSet.tonesRGB).forEach((toneKey) => {
-        const toneRGB = colourSet.tonesRGB[toneKey];
-        let squareDistance = squaredEuclideanMetricColours(toneRGB, pixelRGB);
-        if (squareDistance < shortestDistance1) {
-          shortestDistance1 = squareDistance;
-          closestPixel1 = {
-            colourSetId: colourSet.colourSetId,
-            tone: toneKey,
-          };
-        }
-        if (squareDistance < shortestDistance2 && colourSetIdAndToneToRGB(closestPixel1.colourSetId, closestPixel1.tone) !== toneRGB) {
-          shortestDistance2 = squareDistance;
-          closestPixel2 = {
-            colourSetId: colourSet.colourSetId,
-            tone: toneKey,
-          };
-        }
+// Inverse of linearized(): linear light in [0, 1] back to sRGB on 0-255.
+function delinearized(value) {
+  const clamped = value <= 0 ? 0 : value >= 1 ? 1 : value;
+  if (clamped <= 0.0031308) {
+    return clamped * 12.92 * 255.0;
+  }
+  return (1.055 * Math.pow(clamped, 1.0 / 2.4) - 0.055) * 255.0;
+}
+
+// "linear" accumulates error in linear light, "srgb" in gamma-encoded sRGB.
+const DITHER_SPACE = "linear";
+
+function clampDitherSpace(value) {
+  const top = DITHER_SPACE === "srgb" ? 255 : 1;
+  return value <= 0 ? 0 : value >= top ? top : value;
+}
+
+function rgbToDitherSpace(r, g, b) {
+  if (DITHER_SPACE === "srgb") {
+    return [r, g, b];
+  }
+  return [linearized(r), linearized(g), linearized(b)];
+}
+
+function ditherSpaceToRgb(d0, d1, d2) {
+  if (DITHER_SPACE === "srgb") {
+    return [d0, d1, d2];
+  }
+  return [delinearized(d0), delinearized(d1), delinearized(d2)];
+}
+
+// x^7, as four multiplications. CIEDE2000 needs it twice per comparison and
+// Math.pow is far slower than the chain for a fixed small integer exponent.
+function pow7(x) {
+  const x2 = x * x;
+  const x3 = x2 * x;
+  return x3 * x3 * x;
+}
+
+const POW_25_7 = 6103515625; // 25^7
+
+// CIEDE2000 between two points that are *already* in L*a*b*. `cStd`, the chroma
+// of the first point, is passed in by the palette search, which hoists it out
+// of its loop; it is derived here when omitted.
+// Code based on culori.js - https://culorijs.org/
+function ciede2000InLab(lStd, aStd, bStd, lSmp, aSmp, bSmp, cStdIn) {
+  let cStd = cStdIn === undefined ? Math.sqrt(aStd * aStd + bStd * bStd) : cStdIn;
+  let cSmp = Math.sqrt(aSmp * aSmp + bSmp * bSmp);
+  let cAvg = (cStd + cSmp) / 2;
+
+  let cAvgPow7 = pow7(cAvg);
+  let G = 0.5 * (1 - Math.sqrt(cAvgPow7 / (cAvgPow7 + POW_25_7)));
+
+  let apStd = aStd * (1 + G);
+  let apSmp = aSmp * (1 + G);
+
+  let cpStd = Math.sqrt(apStd * apStd + bStd * bStd);
+  let cpSmp = Math.sqrt(apSmp * apSmp + bSmp * bSmp);
+
+  let hpStd = Math.abs(apStd) + Math.abs(bStd) === 0 ? 0 : Math.atan2(bStd, apStd);
+  hpStd += (hpStd < 0) * 2 * Math.PI;
+
+  let hpSmp = Math.abs(apSmp) + Math.abs(bSmp) === 0 ? 0 : Math.atan2(bSmp, apSmp);
+  hpSmp += (hpSmp < 0) * 2 * Math.PI;
+
+  let dL = lSmp - lStd;
+  let dC = cpSmp - cpStd;
+
+  let cpStdtimescpSmpZero = cpStd === 0 && cpSmp === 0;
+  let dhp = cpStdtimescpSmpZero ? 0 : hpSmp - hpStd;
+  dhp -= (dhp > Math.PI) * 2 * Math.PI;
+  dhp += (dhp < -Math.PI) * 2 * Math.PI;
+
+  let dH = 2 * Math.sqrt(cpStd * cpSmp) * Math.sin(dhp / 2);
+
+  let Lp = (lStd + lSmp) / 2;
+  let Cp = (cpStd + cpSmp) / 2;
+
+  let hp;
+  if (cpStdtimescpSmpZero) {
+    hp = hpStd + hpSmp;
+  } else {
+    hp = (hpStd + hpSmp) / 2;
+    hp -= (Math.abs(hpStd - hpSmp) > Math.PI) * Math.PI;
+    hp += (hp < 0) * 2 * Math.PI;
+  }
+
+  let Lpminus50 = Lp - 50;
+  let Lpm50 = Lpminus50 * Lpminus50;
+  let T =
+    1 -
+    0.17 * Math.cos(hp - Math.PI / 6) +
+    0.24 * Math.cos(2 * hp) +
+    0.32 * Math.cos(3 * hp + Math.PI / 30) -
+    0.2 * Math.cos(4 * hp - (63 * Math.PI) / 180);
+
+  let Sl = 1 + (0.015 * Lpm50) / Math.sqrt(20 + Lpm50);
+  let Sc = 1 + 0.045 * Cp;
+  let Sh = 1 + 0.015 * Cp * T;
+
+  const hpOffset = ((180 / Math.PI) * hp - 275) / 25;
+  let deltaTheta = ((30 * Math.PI) / 180) * Math.exp(-1 * (hpOffset * hpOffset));
+  const CpPow7 = pow7(Cp);
+  let Rc = 2 * Math.sqrt(CpPow7 / (CpPow7 + POW_25_7));
+
+  let Rt = -1 * Math.sin(2 * deltaTheta) * Rc;
+
+  let dLdivSl = dL / Sl;
+  let dCdivSc = dC / Sc;
+  let dHdivSh = dH / Sh;
+  return dLdivSl * dLdivSl + dCdivSc * dCdivSc + dHdivSh * dHdivSh + (((Rt * dC) / Sc) * dH) / Sh;
+}
+
+// Distance between two points that are already in the active colour space.
+function metricDistanceInSpace(x0, x1, x2, y0, y1, y2) {
+  if (isCiede2000Method(optionValue_betterColour)) {
+    return ciede2000InLab(x0, x1, x2, y0, y1, y2);
+  }
+  const d0 = x0 - y0;
+  const d1 = x1 - y1;
+  const d2 = x2 - y2;
+  return d0 * d0 + d1 * d1 + d2 * d2;
+}
+
+// ---------------------------------------------------------------------------
+// Flat palette
+//
+// colourSetsToUse is a nested {colourSetId -> {tone -> rgb}} structure; the
+// quantiser wants a flat, index-addressable list whose colour-space
+// coordinates are computed exactly once instead of on every pixel comparison.
+// ---------------------------------------------------------------------------
+
+function setupPalette() {
+  paletteEntries = [];
+  colourSetsToUse.forEach((colourSet) => {
+    Object.keys(colourSet.tonesRGB).forEach((toneKey) => {
+      paletteEntries.push({
+        colourSetId: colourSet.colourSetId,
+        tone: toneKey,
+        rgb: colourSet.tonesRGB[toneKey],
       });
     });
-    if (
-      shortestDistance2 !== 9999999 && // to make sure closestPixel2.colourSetId/tone is not null
-      squaredEuclideanMetricColours(
-        colourSetIdAndToneToRGB(closestPixel1.colourSetId, closestPixel1.tone),
-        colourSetIdAndToneToRGB(closestPixel2.colourSetId, closestPixel2.tone)
-      ) <= shortestDistance2
-    ) {
-      closestPixel2 = closestPixel1; // if closestPixel1 is a better fit to closestPixel2 than closestPixel2 is to the actual pixel
-    }
-    let newPixels = [shortestDistance1, shortestDistance2, closestPixel1, closestPixel2];
-    colourCache.set(RGBBinary, newPixels);
-    return newPixels;
+  });
+
+  paletteCoords = new Float64Array(paletteEntries.length * 3);
+  paletteDitherCoords = new Float64Array(paletteEntries.length * 3);
+  for (let i = 0; i < paletteEntries.length; i++) {
+    const rgb = paletteEntries[i].rgb;
+    const coords = colourToSpace(rgb);
+    paletteCoords[i * 3] = coords[0];
+    paletteCoords[i * 3 + 1] = coords[1];
+    paletteCoords[i * 3 + 2] = coords[2];
+    const ditherCoords = rgbToDitherSpace(rgb[0], rgb[1], rgb[2]);
+    paletteDitherCoords[i * 3] = ditherCoords[0];
+    paletteDitherCoords[i * 3 + 1] = ditherCoords[1];
+    paletteDitherCoords[i * 3 + 2] = ditherCoords[2];
   }
+}
+
+// Nearest palette entry to a point already expressed in the active colour space.
+//
+// Both branches scan the whole palette. Shortlisting the palette by plain
+// L*a*b* distance and scoring only the shortlist with CIEDE2000 is tempting and
+// several times faster, but it is not equivalent: CIEDE2000's chroma and hue
+// weighting lets a colour that is not among the sixteen nearest in L*a*b* still
+// win, which measurably changes around 1.6% of pixels.
+function nearestPaletteIndexInSpace(v0, v1, v2) {
+  const n = paletteEntries.length;
+  let bestIdx = -1;
+  let bestDist = Infinity;
+
+  if (isCiede2000Method(optionValue_betterColour)) {
+    // The source point's chroma does not vary over the palette, so it is
+    // computed once here rather than once per comparison.
+    const cStd = Math.sqrt(v1 * v1 + v2 * v2);
+    for (let i = 0; i < n; i++) {
+      const dist = ciede2000InLab(v0, v1, v2, paletteCoords[i * 3], paletteCoords[i * 3 + 1], paletteCoords[i * 3 + 2], cStd);
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestIdx = i;
+      }
+    }
+    return bestIdx;
+  }
+
+  for (let i = 0; i < n; i++) {
+    const d0 = paletteCoords[i * 3] - v0;
+    const d1 = paletteCoords[i * 3 + 1] - v1;
+    const d2 = paletteCoords[i * 3 + 2] - v2;
+    const dist = d0 * d0 + d1 * d1 + d2 * d2;
+    if (dist < bestDist) {
+      bestDist = dist;
+      bestIdx = i;
+    }
+  }
+  return bestIdx;
+}
+
+// The closest two palette entries to a point already expressed in the active
+// colour space. Ordered dithering alternates between them on a fixed lattice,
+// so it needs the runner-up and both distances, not just the winner.
+function nearestPaletteIndexPairInSpace(v0, v1, v2) {
+  const n = paletteEntries.length;
+  let nearestIndex = -1;
+  let nearestDistance = Infinity;
+  let runnerUpIndex = -1;
+  let runnerUpDistance = Infinity;
+  for (let i = 0; i < n; i++) {
+    const dist = metricDistanceInSpace(v0, v1, v2, paletteCoords[i * 3], paletteCoords[i * 3 + 1], paletteCoords[i * 3 + 2]);
+    if (dist < nearestDistance) {
+      runnerUpDistance = nearestDistance;
+      runnerUpIndex = nearestIndex;
+      nearestDistance = dist;
+      nearestIndex = i;
+    } else if (dist < runnerUpDistance) {
+      runnerUpDistance = dist;
+      runnerUpIndex = i;
+    }
+  }
+  if (runnerUpIndex === -1) {
+    // a single-entry palette: there is nothing to alternate with
+    runnerUpIndex = nearestIndex;
+    runnerUpDistance = nearestDistance;
+  } else {
+    // If the two candidates are closer to each other than the runner-up is to
+    // the source pixel, mixing them buys nothing but noise; collapse to the best.
+    const nearest = nearestIndex * 3;
+    const runnerUp = runnerUpIndex * 3;
+    const between = metricDistanceInSpace(
+      paletteCoords[nearest],
+      paletteCoords[nearest + 1],
+      paletteCoords[nearest + 2],
+      paletteCoords[runnerUp],
+      paletteCoords[runnerUp + 1],
+      paletteCoords[runnerUp + 2]
+    );
+    if (between <= runnerUpDistance) {
+      runnerUpIndex = nearestIndex;
+      runnerUpDistance = nearestDistance;
+    }
+  }
+  return { nearestIndex, nearestDistance, runnerUpIndex, runnerUpDistance };
+}
+
+// RGB-keyed cached wrappers, used where the input really is an 8-bit pixel
+// (undithered pass, ordered dithers, GA seeding).
+function nearestPaletteIndexFor(pixelRGB) {
+  const RGBBinary = (pixelRGB[0] << 16) + (pixelRGB[1] << 8) + pixelRGB[2];
+  const cached = nearestColourCache.get(RGBBinary);
+  if (cached !== undefined) {
+    return cached;
+  }
+  const c = colourToSpace(pixelRGB);
+  const idx = nearestPaletteIndexInSpace(c[0], c[1], c[2]);
+  nearestColourCache.set(RGBBinary, idx);
+  return idx;
+}
+
+
+function nearestPaletteIndexPairFor(pixelRGB) {
+  const RGBBinary = (pixelRGB[0] << 16) + (pixelRGB[1] << 8) + pixelRGB[2];
+  const cached = nearestPairCache.get(RGBBinary);
+  if (cached !== undefined) {
+    return cached;
+  }
+  const c = colourToSpace(pixelRGB);
+  const result = nearestPaletteIndexPairInSpace(c[0], c[1], c[2]);
+  nearestPairCache.set(RGBBinary, result);
+  return result;
 }
 
 function setupColourSetsToUse() {
@@ -480,10 +632,6 @@ function isSupportBlockMandatoryForColourSetIdAndTone(colourSetIdAndTone) {
   return coloursJSON[colourSetIdAndTone.colourSetId].blocks[selectedBlocks[colourSetIdAndTone.colourSetId]].supportBlockMandatory;
 }
 
-function colourSetIdAndToneToRGB(colourSetId, tone) {
-  return coloursJSON[colourSetId]["tonesRGB"][tone];
-}
-
 function getMapartImageDataAndMaterials() {
   for (let y = 0; y < optionValue_mapSize_y; y++) {
     let mapsRowToAdd = [];
@@ -509,39 +657,20 @@ function getMapartImageDataAndMaterials() {
     );
   }
 
-  let ditherMatrix;
-  let divisor;
-  const chosenDitherMethod =
-    DitherMethods[Object.keys(DitherMethods).find((ditherMethodKey) => DitherMethods[ditherMethodKey].uniqueId === optionValue_dithering)];
-  if (chosenDitherMethod.uniqueId !== DitherMethods.None.uniqueId) {
-    ditherMatrix = chosenDitherMethod.ditherMatrix;
+  if (optionValue_betterColour === ColourMethods.GaCvter.uniqueId) {
+    runGaConverter();
+  } else {
+    quantiseImage();
   }
-  if (
-    [
-      DitherMethods.FloydSteinberg.uniqueId,
-      DitherMethods.FloydSteinberg_20.uniqueId,
-      DitherMethods.FloydSteinberg_24.uniqueId,
-      DitherMethods.Atkinson.uniqueId,
-      DitherMethods.Atkinson_6.uniqueId,
-      DitherMethods.Atkinson_10.uniqueId,
-      DitherMethods.Atkinson_12.uniqueId,
-      DitherMethods.SierraFilterLite.uniqueId,
-      DitherMethods.Fan.uniqueId,
-      DitherMethods.ShiauFan.uniqueId,
-      DitherMethods.ShiauFan2.uniqueId,
-      DitherMethods.JarvisJudiceNinke.uniqueId,
-      DitherMethods.Stucki.uniqueId,
-      DitherMethods.Burkes.uniqueId,
-      DitherMethods.Sierra.uniqueId,
-      DitherMethods.SierraTworow.uniqueId,
-    ].includes(chosenDitherMethod.uniqueId)
-  ) {
-    divisor = chosenDitherMethod.ditherDivisor;
-  }
+
+  // -------------------------------------------------------------------------
+  // Materials and support-block accounting.
+  //
+  // Runs as a second pass in raster order: the quantiser may walk rows
+  // backwards (serpentine dithering), and this pass reads the already-decided
+  // colours of the pixels to the north, so it cannot be interleaved with it.
+  // -------------------------------------------------------------------------
   for (let i = 0; i < canvasImageData.data.length; i += 4) {
-    const indexR = i;
-    const indexG = i + 1;
-    const indexB = i + 2;
     const indexA = i + 3;
 
     const multimapWidth = optionValue_mapSize_x * 128;
@@ -550,178 +679,13 @@ function getMapartImageDataAndMaterials() {
     const whichMap_x = Math.floor(multimap_x / 128);
     const whichMap_y = Math.floor(multimap_y / 128);
     const individualMap_y = multimap_y % 128;
-    if (multimap_x === 0) {
-      postMessage({
-        head: "PROGRESS_REPORT",
-        body: multimap_y / (128 * optionValue_mapSize_y),
-      });
+
+    const paletteIndex = pixelPaletteIndex[i / 4];
+    if (paletteIndex < 0) {
+      continue; // fully transparent mapdat pixel: no block, no material
     }
-
-    let closestColourSetIdAndTone;
-    if (
-      optionValue_modeNBTOrMapdat === MapModes.MAPDAT.uniqueId &&
-      optionValue_transparency &&
-      canvasImageData.data[indexA] < optionValue_transparencyTolerance
-    ) {
-      // we specially reserve 0,0,0,0 for transparent in mapdats
-      canvasImageData.data[indexR] = 0;
-      canvasImageData.data[indexG] = 0;
-      canvasImageData.data[indexB] = 0;
-      canvasImageData.data[indexA] = 0;
-    } else {
-      if (canvasImageData.data[indexA] !== 0 || selectedBlocks[alphaColorIdx] < 0) {
-        canvasImageData.data[indexA] = 255; // full opacity
-      }
-      const oldPixel = [canvasImageData.data[indexR], canvasImageData.data[indexG], canvasImageData.data[indexB]];
-      switch (chosenDitherMethod.uniqueId) {
-        // Switch statement that checks the dither method every pixel;
-        // I have tested a refactor that only checks once however the time difference is negligible and code quality deteriorates
-        case DitherMethods.None.uniqueId: {
-          closestColourSetIdAndTone = findClosestColourSetIdAndToneAndRGBTo(oldPixel);
-          const closestColour = colourSetIdAndToneToRGB(closestColourSetIdAndTone.colourSetId, closestColourSetIdAndTone.tone);
-          canvasImageData.data[indexR] = closestColour[0];
-          canvasImageData.data[indexG] = closestColour[1];
-          canvasImageData.data[indexB] = closestColour[2];
-          break;
-        }
-        case DitherMethods.Bayer22.uniqueId:
-        case DitherMethods.Bayer33.uniqueId:
-        case DitherMethods.Bayer44.uniqueId:
-        case DitherMethods.Bayer88.uniqueId:
-        case DitherMethods.Ordered33.uniqueId:
-        case DitherMethods.ClusterDot44.uniqueId:
-        case DitherMethods.Halftone88.uniqueId:
-        case DitherMethods.VoidAndCluster1414.uniqueId: {
-          const newPixels = findClosest2ColourSetIdAndToneAndRGBTo(oldPixel);
-          // newPixels = [shortestDistance1, shortestDistance2, newPixel1, newPixel2]
-          if (
-            (newPixels[0] * (ditherMatrix[0].length * ditherMatrix.length + 1)) / newPixels[1] >
-            ditherMatrix[multimap_x % ditherMatrix[0].length][multimap_y % ditherMatrix.length]
-          ) {
-            closestColourSetIdAndTone = newPixels[3];
-          } else {
-            closestColourSetIdAndTone = newPixels[2];
-          }
-          const closestColour = colourSetIdAndToneToRGB(closestColourSetIdAndTone.colourSetId, closestColourSetIdAndTone.tone);
-          canvasImageData.data[indexR] = closestColour[0];
-          canvasImageData.data[indexG] = closestColour[1];
-          canvasImageData.data[indexB] = closestColour[2];
-          break;
-        }
-        //Error diffusion algorithms
-        case DitherMethods.FloydSteinberg.uniqueId:
-        case DitherMethods.FloydSteinberg_20.uniqueId:
-        case DitherMethods.FloydSteinberg_24.uniqueId:
-        case DitherMethods.Atkinson.uniqueId:
-        case DitherMethods.Atkinson_6.uniqueId:
-        case DitherMethods.Atkinson_10.uniqueId:
-        case DitherMethods.Atkinson_12.uniqueId:
-        case DitherMethods.SierraFilterLite.uniqueId:
-        case DitherMethods.Fan.uniqueId:
-        case DitherMethods.ShiauFan.uniqueId:
-        case DitherMethods.ShiauFan2.uniqueId:
-        case DitherMethods.JarvisJudiceNinke.uniqueId:
-        case DitherMethods.Stucki.uniqueId:
-        case DitherMethods.Burkes.uniqueId:
-        case DitherMethods.Sierra.uniqueId:
-        case DitherMethods.SierraTworow.uniqueId:
-        {
-          closestColourSetIdAndTone = findClosestColourSetIdAndToneAndRGBTo(oldPixel);
-          const closestColour = colourSetIdAndToneToRGB(closestColourSetIdAndTone.colourSetId, closestColourSetIdAndTone.tone);
-          canvasImageData.data[indexR] = closestColour[0];
-          canvasImageData.data[indexG] = closestColour[1];
-          canvasImageData.data[indexB] = closestColour[2];
-
-          const quant_error = [
-            (oldPixel[0] - closestColour[0]) * optionValue_dithering_propagation_red / 100.0,
-            (oldPixel[1] - closestColour[1]) * optionValue_dithering_propagation_green / 100.0,
-            (oldPixel[2] - closestColour[2]) * optionValue_dithering_propagation_blue / 100.0
-          ];
-
-          try {
-            // ditherMatrix [0][0...2] should always be zero, and can thus be skipped
-            if (multimap_x + 1 < multimapWidth) {
-              // Make sure to not carry over error from one side to the other
-              const weight = ditherMatrix[0][3] / divisor; // 1 right
-              canvasImageData.data[i + 4] += quant_error[0] * weight;
-              canvasImageData.data[i + 5] += quant_error[1] * weight;
-              canvasImageData.data[i + 6] += quant_error[2] * weight;
-              if (multimap_x + 2 < multimapWidth) {
-                const weight = ditherMatrix[0][4] / divisor; // 2 right
-                canvasImageData.data[i + 8] += quant_error[0] * weight;
-                canvasImageData.data[i + 9] += quant_error[1] * weight;
-                canvasImageData.data[i + 10] += quant_error[2] * weight;
-              }
-            }
-
-            // First row below
-            if (multimap_x > 0) {
-              // Order reversed, to allow nesting of 'if' blocks
-              const weight = ditherMatrix[1][1] / divisor; // 1 down, 1 left
-              canvasImageData.data[i + multimapWidth * 4 - 4] += quant_error[0] * weight;
-              canvasImageData.data[i + multimapWidth * 4 - 3] += quant_error[1] * weight;
-              canvasImageData.data[i + multimapWidth * 4 - 2] += quant_error[2] * weight;
-              if (multimap_x > 1) {
-                const weight = ditherMatrix[1][0] / divisor; // 1 down, 2 left
-                canvasImageData.data[i + multimapWidth * 4 - 8] += quant_error[0] * weight;
-                canvasImageData.data[i + multimapWidth * 4 - 7] += quant_error[1] * weight;
-                canvasImageData.data[i + multimapWidth * 4 - 6] += quant_error[2] * weight;
-              }
-            }
-            let weight = ditherMatrix[1][2] / divisor; // 1 down
-            canvasImageData.data[i + multimapWidth * 4 + 0] += quant_error[0] * weight;
-            canvasImageData.data[i + multimapWidth * 4 + 1] += quant_error[1] * weight;
-            canvasImageData.data[i + multimapWidth * 4 + 2] += quant_error[2] * weight;
-            if (multimap_x + 1 < multimapWidth) {
-              const weight = ditherMatrix[1][3] / divisor; // 1 down, 1 right
-              canvasImageData.data[i + multimapWidth * 4 + 4] += quant_error[0] * weight;
-              canvasImageData.data[i + multimapWidth * 4 + 5] += quant_error[1] * weight;
-              canvasImageData.data[i + multimapWidth * 4 + 6] += quant_error[2] * weight;
-              if (multimap_x + 2 < multimapWidth) {
-                const weight = ditherMatrix[1][4] / divisor; // 1 down, 2 right
-                canvasImageData.data[i + multimapWidth * 4 + 8] += quant_error[0] * weight;
-                canvasImageData.data[i + multimapWidth * 4 + 9] += quant_error[1] * weight;
-                canvasImageData.data[i + multimapWidth * 4 + 10] += quant_error[2] * weight;
-              }
-            }
-
-            // Second row below
-            if (multimap_x > 0) {
-              const weight = ditherMatrix[2][1] / divisor; // 2 down, 1 left
-              canvasImageData.data[i + multimapWidth * 8 - 4] += quant_error[0] * weight;
-              canvasImageData.data[i + multimapWidth * 8 - 3] += quant_error[1] * weight;
-              canvasImageData.data[i + multimapWidth * 8 - 2] += quant_error[2] * weight;
-              if (multimap_x > 1) {
-                const weight = ditherMatrix[2][0] / divisor; // 2 down, 2 left
-                canvasImageData.data[i + multimapWidth * 8 - 8] += quant_error[0] * weight;
-                canvasImageData.data[i + multimapWidth * 8 - 7] += quant_error[1] * weight;
-                canvasImageData.data[i + multimapWidth * 8 - 6] += quant_error[2] * weight;
-              }
-            }
-            weight = ditherMatrix[2][2] / divisor; // 2 down
-            canvasImageData.data[i + multimapWidth * 8 + 0] += quant_error[0] * weight;
-            canvasImageData.data[i + multimapWidth * 8 + 1] += quant_error[1] * weight;
-            canvasImageData.data[i + multimapWidth * 8 + 2] += quant_error[2] * weight;
-            if (multimap_x + 1 < multimapWidth) {
-              const weight = ditherMatrix[2][3] / divisor; // 2 down, 1 right
-              canvasImageData.data[i + multimapWidth * 8 + 4] += quant_error[0] * weight;
-              canvasImageData.data[i + multimapWidth * 8 + 5] += quant_error[1] * weight;
-              canvasImageData.data[i + multimapWidth * 8 + 6] += quant_error[2] * weight;
-              if (multimap_x + 2 < multimapWidth) {
-                const weight = ditherMatrix[2][4] / divisor; // 2 down, 2 right
-                canvasImageData.data[i + multimapWidth * 8 + 8] += quant_error[0] * weight;
-                canvasImageData.data[i + multimapWidth * 8 + 9] += quant_error[1] * weight;
-                canvasImageData.data[i + multimapWidth * 8 + 10] += quant_error[2] * weight;
-              }
-            }
-          } catch (e) {
-            console.log(e); // ???
-          }
-          break;
-        }
-        default:
-          break;
-      }
+    const closestColourSetIdAndTone = paletteEntries[paletteIndex];
+    {
 
       if (canvasImageData.data[indexA] !== 0) {
         // support-block count: mapdat can skip this
@@ -896,6 +860,595 @@ function getMapartImageDataAndMaterials() {
   }
 }
 
+const ERROR_DIFFUSION_METHOD_IDS = [
+  "FloydSteinberg",
+  "FloydSteinberg_20",
+  "FloydSteinberg_24",
+  "Atkinson",
+  "Atkinson_6",
+  "Atkinson_10",
+  "Atkinson_12",
+  "SierraFilterLite",
+  "Fan",
+  "ShiauFan",
+  "ShiauFan2",
+  "JarvisJudiceNinke",
+  "Stucki",
+  "Burkes",
+  "Sierra",
+  "SierraTworow",
+];
+
+const ORDERED_METHOD_IDS = ["Bayer22", "Bayer33", "Bayer44", "Bayer88", "Ordered33", "ClusterDot44", "Halftone88", "VoidAndCluster1414"];
+
+function ditherMethodFamily(chosenDitherMethod) {
+  if (ERROR_DIFFUSION_METHOD_IDS.some((key) => DitherMethods[key] !== undefined && DitherMethods[key].uniqueId === chosenDitherMethod.uniqueId)) {
+    return "errorDiffusion";
+  }
+  if (ORDERED_METHOD_IDS.some((key) => DitherMethods[key] !== undefined && DitherMethods[key].uniqueId === chosenDitherMethod.uniqueId)) {
+    return "ordered";
+  }
+  return "none";
+}
+
+/*
+  Quantises the whole image to the palette, writing the result back into
+  canvasImageData and recording the chosen palette entry per pixel.
+
+  Two things here follow SlopeCraft (utilities/ColorManip/imageConvert.hpp)
+  rather than the previous implementation:
+
+  1. The diffused error lives in dedicated float buffers, in the same colour
+     space the colour metric uses. Previously the error was added straight back
+     into canvasImageData.data, which is a Uint8ClampedArray: every write was
+     rounded to an integer and clamped to [0, 255], so sub-unit error was
+     discarded outright and error near black or white was thrown away. That is
+     SlopeCraft's `dither_c3`, an Eigen::ArrayXXf per channel.
+
+  2. Rows alternate direction (serpentine / boustrophedon scanning) with the
+     kernel mirrored on right-to-left rows, which is SlopeCraft's
+     dithermap_LR / dithermap_RL pair. A fixed left-to-right scan makes
+     Floyd-Steinberg drag its error consistently one way and produces the
+     familiar diagonal "worm" texture on smooth gradients.
+*/
+function quantiseImage() {
+  const data = canvasImageData.data;
+  const width = optionValue_mapSize_x * 128;
+  const height = optionValue_mapSize_y * 128;
+  pixelPaletteIndex = new Int32Array(width * height).fill(-1);
+
+  const chosenDitherMethod =
+    DitherMethods[Object.keys(DitherMethods).find((ditherMethodKey) => DitherMethods[ditherMethodKey].uniqueId === optionValue_dithering)];
+  const family = ditherMethodFamily(chosenDitherMethod);
+  const ditherMatrix = family === "none" ? null : chosenDitherMethod.ditherMatrix;
+  const divisor = family === "errorDiffusion" ? chosenDitherMethod.ditherDivisor : 1;
+
+  // Per-channel propagation strength, as a fraction.
+  const propagation = [
+    optionValue_dithering_propagation_red / 100.0,
+    optionValue_dithering_propagation_green / 100.0,
+    optionValue_dithering_propagation_blue / 100.0,
+  ];
+
+  // Rolling float error buffers: the current row and the two rows below it.
+  // Every kernel in ditherMethods.json spans at most 3 rows and +/-2 columns.
+  let errorRow0 = new Float64Array(width * 3);
+  let errorRow1 = new Float64Array(width * 3);
+  let errorRow2 = new Float64Array(width * 3);
+
+  for (let y = 0; y < height; y++) {
+    postMessage({
+      head: "PROGRESS_REPORT",
+      body: y / height,
+    });
+
+    // Serpentine scanning, for error diffusion only: ordered dithers are
+    // position-indexed and an undithered pass has nothing to carry.
+    const rightToLeft = family === "errorDiffusion" && y % 2 === 1;
+
+    for (let step = 0; step < width; step++) {
+      const x = rightToLeft ? width - 1 - step : step;
+      const pixel = y * width + x;
+      const i = pixel * 4;
+      const indexA = i + 3;
+
+      if (optionValue_modeNBTOrMapdat === MapModes.MAPDAT.uniqueId && optionValue_transparency && data[indexA] < optionValue_transparencyTolerance) {
+        // we specially reserve 0,0,0,0 for transparent in mapdats
+        data[i] = 0;
+        data[i + 1] = 0;
+        data[i + 2] = 0;
+        data[indexA] = 0;
+        continue; // no colour chosen, so there is no quantisation error to spread
+      }
+
+      if (data[indexA] !== 0 || selectedBlocks[alphaColorIdx] < 0) {
+        data[indexA] = 255; // full opacity
+      }
+
+      const sourcePixel = [data[i], data[i + 1], data[i + 2]];
+      let paletteIndex;
+
+      if (family === "ordered") {
+        // How far the pixel sits between its two nearest palette colours decides
+        // how often the lattice should fall to the runner-up instead of the winner.
+        const pair = nearestPaletteIndexPairFor(sourcePixel);
+        const latticeCells = ditherMatrix[0].length * ditherMatrix.length;
+        const threshold = ditherMatrix[x % ditherMatrix[0].length][y % ditherMatrix.length];
+        if ((pair.nearestDistance * (latticeCells + 1)) / pair.runnerUpDistance > threshold) {
+          paletteIndex = pair.runnerUpIndex;
+        } else {
+          paletteIndex = pair.nearestIndex;
+        }
+      } else if (family === "none") {
+        paletteIndex = nearestPaletteIndexFor(sourcePixel);
+      } else {
+        // Error diffusion. The pixel is carried in dither space (linear light)
+        // and the accumulated error is added there, at full float precision.
+        const source = rgbToDitherSpace(sourcePixel[0], sourcePixel[1], sourcePixel[2]);
+        const base = x * 3;
+        // Clamped before use: out-of-gamut coordinates have no colour to match
+        // against, and letting them accumulate makes the error run away.
+        const v0 = clampDitherSpace(source[0] + errorRow0[base]);
+        const v1 = clampDitherSpace(source[1] + errorRow0[base + 1]);
+        const v2 = clampDitherSpace(source[2] + errorRow0[base + 2]);
+
+        // Matching stays perceptual: back to sRGB, then into the chosen metric.
+        const asRgb = ditherSpaceToRgb(v0, v1, v2);
+        const metric = colourToSpaceF(asRgb[0], asRgb[1], asRgb[2]);
+        paletteIndex = nearestPaletteIndexInSpace(metric[0], metric[1], metric[2]);
+
+        const chosen = paletteIndex * 3;
+        const error0 = (v0 - paletteDitherCoords[chosen]) * propagation[0];
+        const error1 = (v1 - paletteDitherCoords[chosen + 1]) * propagation[1];
+        const error2 = (v2 - paletteDitherCoords[chosen + 2]) * propagation[2];
+
+        // ditherMatrix is indexed [dy][dx + 2], with the current pixel at [0][2].
+        for (let dy = 0; dy < 3; dy++) {
+          if (y + dy >= height) {
+            break;
+          }
+          const targetRow = dy === 0 ? errorRow0 : dy === 1 ? errorRow1 : errorRow2;
+          const kernelRow = ditherMatrix[dy];
+          for (let dx = -2; dx <= 2; dx++) {
+            if (dy === 0 && dx <= 0) {
+              continue; // the current pixel and everything already visited on this row
+            }
+            const rawWeight = kernelRow[dx + 2];
+            if (rawWeight === 0) {
+              continue;
+            }
+            // On right-to-left rows the kernel is mirrored, which is equivalent
+            // to mirroring the offset it is applied at.
+            const targetX = rightToLeft ? x - dx : x + dx;
+            if (targetX < 0 || targetX >= width) {
+              continue; // never carry error across the edge of the multimap
+            }
+            const weight = rawWeight / divisor;
+            const target = targetX * 3;
+            targetRow[target] += error0 * weight;
+            targetRow[target + 1] += error1 * weight;
+            targetRow[target + 2] += error2 * weight;
+          }
+        }
+      }
+
+      const chosenColour = paletteEntries[paletteIndex].rgb;
+      data[i] = chosenColour[0];
+      data[i + 1] = chosenColour[1];
+      data[i + 2] = chosenColour[2];
+      pixelPaletteIndex[pixel] = paletteIndex;
+    }
+
+    // Advance the rolling window: row y+1 becomes the current row.
+    const recycled = errorRow0;
+    errorRow0 = errorRow1;
+    errorRow1 = errorRow2;
+    errorRow2 = recycled;
+    errorRow2.fill(0);
+  }
+}
+
+// ===========================================================================
+// GA colour method, ported from SlopeCraft
+// ===========================================================================
+const GA_POPULATION_SIZE = 50; // SlopeCraft GA_converter_option::popSize
+const GA_MAX_GENERATIONS = 200; // SlopeCraft GA_converter_option::maxGeneration
+const GA_MAX_FAIL_TIMES = 50; // SlopeCraft GA_converter_option::maxFailTimes
+const GA_CROSSOVER_PROB = 0.8; // SlopeCraft GA_converter_option::crossoverProb
+const GA_MUTATION_PROB = 0.01; // SlopeCraft GA_converter_option::mutationProb
+const GA_STRONG_MUTATION_RATIO = 0.01; // privateMutateFun<true>'s per-pixel rate
+const GA_TOURNAMENT_SIZE = 3; // GAConverter::GAConverter -> setTournamentSize(3)
+const GA_ORDER_MAX = 4; // GACvterDefines.hpp OrderMax
+
+// GACvterDefines.hpp `Gaussian`
+const GA_GAUSSIAN = [2, 4, 5, 4, 2, 4, 9, 12, 9, 4, 5, 12, 15, 12, 5, 4, 9, 12, 9, 4, 2, 4, 5, 4, 2];
+const GA_GAUSSIAN_SUM = 159;
+
+const GA_GRAY_MAX = 255; // GACvterDefines.hpp GrayMax
+const GA_GRAY_WEIGHT = 1 + Math.pow(1.5, 2.2) + Math.pow(0.6, 2.2);
+
+// GACvterDefines.hpp RGB2Gray_Gamma; r, g, b in [0, 1]
+function rgb2GrayGamma(r, g, b) {
+  const poweredSum = Math.pow(r, 2.2) + Math.pow(1.5 * g, 2.2) + Math.pow(0.6 * b, 2.2);
+  return Math.pow(poweredSum / GA_GRAY_WEIGHT, 1.0 / 2.2);
+}
+
+// 5x5 Gaussian then 3x3 Sobel magnitude, both 'valid' (no padding), exactly as
+// GACvterDefines.hpp applyGaussian + applySobel. Shrinks by 6 in each axis.
+function gaEdgeFeature(gray, width, height, blurScratch, edgeOut) {
+  const blurWidth = width - 4;
+  const blurHeight = height - 4;
+  for (let r = 0; r < blurHeight; r++) {
+    for (let c = 0; c < blurWidth; c++) {
+      let sum = 0;
+      for (let kr = 0; kr < 5; kr++) {
+        const rowBase = (r + kr) * width + c;
+        const kernelBase = kr * 5;
+        sum +=
+          gray[rowBase] * GA_GAUSSIAN[kernelBase] +
+          gray[rowBase + 1] * GA_GAUSSIAN[kernelBase + 1] +
+          gray[rowBase + 2] * GA_GAUSSIAN[kernelBase + 2] +
+          gray[rowBase + 3] * GA_GAUSSIAN[kernelBase + 3] +
+          gray[rowBase + 4] * GA_GAUSSIAN[kernelBase + 4];
+      }
+      blurScratch[r * blurWidth + c] = sum / GA_GAUSSIAN_SUM;
+    }
+  }
+
+  const edgeWidth = blurWidth - 2;
+  const edgeHeight = blurHeight - 2;
+  for (let r = 0; r < edgeHeight; r++) {
+    for (let c = 0; c < edgeWidth; c++) {
+      const top = r * blurWidth + c;
+      const mid = top + blurWidth;
+      const bottom = mid + blurWidth;
+      const p00 = blurScratch[top];
+      const p01 = blurScratch[top + 1];
+      const p02 = blurScratch[top + 2];
+      const p10 = blurScratch[mid];
+      const p12 = blurScratch[mid + 2];
+      const p20 = blurScratch[bottom];
+      const p21 = blurScratch[bottom + 1];
+      const p22 = blurScratch[bottom + 2];
+      const gx = p00 + 2 * p01 + p02 - (p20 + 2 * p21 + p22);
+      const gy = p02 - p00 + 2 * (p12 - p10) + p22 - p20;
+      edgeOut[r * edgeWidth + c] = Math.sqrt(gx * gx + gy * gy);
+    }
+  }
+}
+
+// Runs fn with a different colour method temporarily active. The colour caches
+// and the palette coordinates are method-dependent, so both are rebuilt.
+function withColourMethod(methodUniqueId, fn) {
+  const previous = optionValue_betterColour;
+  optionValue_betterColour = methodUniqueId;
+  nearestColourCache.clear();
+  nearestPairCache.clear();
+  setupPalette();
+  try {
+    return fn();
+  } finally {
+    optionValue_betterColour = previous;
+    nearestColourCache.clear();
+    nearestPairCache.clear();
+    setupPalette();
+  }
+}
+
+// Entry point for the GaCvter colour method; getMapartImageDataAndMaterials
+// calls this instead of quantiseImage, then this calls quantiseImage itself.
+function runGaConverter() {
+  const data = canvasImageData.data;
+  const width = optionValue_mapSize_x * 128;
+  const height = optionValue_mapSize_y * 128;
+  const pixelCount = width * height;
+
+  // The Gaussian and Sobel passes are 'valid', so anything under 7x7 has no
+  // edge map at all; a palette of under 2 entries leaves the GA nothing to
+  // choose between either.
+  if (width < 7 || height < 7 || paletteEntries.length < 2) {
+    quantiseImage();
+    return;
+  }
+
+  const orderMax = Math.min(GA_ORDER_MAX, paletteEntries.length);
+
+  // --- per-pixel candidate shortlist (SlopeCraft sortColor::calculate) ------
+  // The nearest `orderMax` palette entries by plain Euclidean RGB distance.
+  const candidates = new Int32Array(pixelCount * GA_ORDER_MAX);
+  const opaque = new Uint8Array(pixelCount);
+  const sortColourCache = new Map();
+  const paletteCount = paletteEntries.length;
+  const scratchDist = new Float64Array(paletteCount);
+
+  for (let pixel = 0; pixel < pixelCount; pixel++) {
+    const i = pixel * 4;
+    if (data[i + 3] === 0) {
+      continue; // transparent: excluded from the edge map, and left to quantiseImage
+    }
+    opaque[pixel] = 1;
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
+    const key = (r << 16) + (g << 8) + b;
+    let shortlist = sortColourCache.get(key);
+    if (shortlist === undefined) {
+      for (let p = 0; p < paletteCount; p++) {
+        const rgb = paletteEntries[p].rgb;
+        const dr = rgb[0] - r;
+        const dg = rgb[1] - g;
+        const db = rgb[2] - b;
+        scratchDist[p] = dr * dr + dg * dg + db * db;
+      }
+      shortlist = new Int32Array(GA_ORDER_MAX);
+      for (let o = 0; o < GA_ORDER_MAX; o++) {
+        let bestIdx = 0;
+        let bestDist = Infinity;
+        for (let p = 0; p < paletteCount; p++) {
+          if (scratchDist[p] < bestDist) {
+            bestDist = scratchDist[p];
+            bestIdx = p;
+          }
+        }
+        shortlist[o] = bestIdx;
+        scratchDist[bestIdx] = Infinity;
+      }
+      sortColourCache.set(key, shortlist);
+    }
+    const base = pixel * GA_ORDER_MAX;
+    for (let o = 0; o < GA_ORDER_MAX; o++) {
+      candidates[base + o] = shortlist[o];
+    }
+  }
+
+  // --- grayscale lookup for the palette (updateMapColor2GrayLUT) -----------
+  const paletteGray = new Float64Array(paletteCount);
+  for (let p = 0; p < paletteCount; p++) {
+    const rgb = paletteEntries[p].rgb;
+    paletteGray[p] = GA_GRAY_MAX * rgb2GrayGamma(rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0);
+  }
+
+  // --- edge map of the source image (GAConverter::setRawImage) -------------
+  const blurScratch = new Float64Array((width - 4) * (height - 4));
+  const edgeWidth = width - 6;
+  const edgeHeight = height - 6;
+  const edgeSize = edgeWidth * edgeHeight;
+  const sourceEdge = new Float64Array(edgeSize);
+  const candidateEdge = new Float64Array(edgeSize);
+  const gray = new Float64Array(pixelCount);
+
+  for (let pixel = 0; pixel < pixelCount; pixel++) {
+    if (!opaque[pixel]) {
+      gray[pixel] = 0;
+      continue;
+    }
+    const i = pixel * 4;
+    gray[pixel] = GA_GRAY_MAX * rgb2GrayGamma(data[i] / 255.0, data[i + 1] / 255.0, data[i + 2] / 255.0);
+  }
+  gaEdgeFeature(gray, width, height, blurScratch, sourceEdge);
+
+  // GAConverter::fFun -- log10 of the mean absolute edge-map difference.
+  // Lower is better (heu::FitnessOption::FITNESS_LESS_BETTER).
+  function fitness(genome) {
+    for (let pixel = 0; pixel < pixelCount; pixel++) {
+      gray[pixel] = opaque[pixel] ? paletteGray[candidates[pixel * GA_ORDER_MAX + genome[pixel]]] : 0;
+    }
+    gaEdgeFeature(gray, width, height, blurScratch, candidateEdge);
+    let total = 0;
+    for (let e = 0; e < edgeSize; e++) {
+      total += Math.abs(candidateEdge[e] - sourceEdge[e]);
+    }
+    return Math.log10(total / pixelCount);
+  }
+
+  // --- seeds: the results of the other colour methods ----------------------
+  // SlopeCraft seeds with RGB, RGB_Better, Lab94, HSV and XYZ; these are this
+  // project's equivalents. CIEDE2000 is left out: it would contribute the same
+  // direction as CIE76 for many times the cost.
+  const seedMethods = [
+    ColourMethods.Euclidian.uniqueId,
+    ColourMethods.MapartCraftDefault.uniqueId,
+    ColourMethods.Cie76_Lab65.uniqueId,
+    ColourMethods.Cie76_Lab50.uniqueId,
+    ColourMethods.Hct.uniqueId,
+  ];
+  const seeds = [];
+  for (const method of seedMethods) {
+    const seed = new Uint8Array(pixelCount);
+    withColourMethod(method, () => {
+      for (let pixel = 0; pixel < pixelCount; pixel++) {
+        if (!opaque[pixel]) {
+          continue;
+        }
+        const i = pixel * 4;
+        const chosen = nearestPaletteIndexFor([data[i], data[i + 1], data[i + 2]]);
+        // GAConverter::setSeeds: find which of the shortlisted candidates this is
+        const base = pixel * GA_ORDER_MAX;
+        for (let o = 0; o < orderMax; o++) {
+          if (candidates[base + o] === chosen) {
+            seed[pixel] = o;
+            break;
+          }
+        }
+      }
+    });
+    seeds.push(seed);
+  }
+
+  // --- GA operators (GAConverter.cpp) --------------------------------------
+  const randomOrder = () => Math.floor(Math.random() * orderMax);
+  // GACvterDefines.hpp makeMutateMap: pick an order that differs from the current one
+  const differentOrder = (current) => {
+    const pick = Math.floor(Math.random() * (orderMax - 1));
+    return pick >= current ? pick + 1 : pick;
+  };
+
+  function mutate(parent, strong) {
+    const child = Uint8Array.from(parent);
+    if (strong) {
+      for (let pixel = 0; pixel < pixelCount; pixel++) {
+        if (Math.random() <= GA_STRONG_MUTATION_RATIO) {
+          child[pixel] = differentOrder(child[pixel]);
+        }
+      }
+    } else {
+      const pixel = Math.floor(Math.random() * pixelCount);
+      child[pixel] = differentOrder(child[pixel]);
+    }
+    return child;
+  }
+
+  // GAConverter::iFun
+  function createIndividual() {
+    if (Math.random() < 1.0 / 3) {
+      // random, but consistent per source colour
+      const orderByColour = new Map();
+      const individual = new Uint8Array(pixelCount);
+      for (let pixel = 0; pixel < pixelCount; pixel++) {
+        if (!opaque[pixel]) {
+          continue;
+        }
+        const i = pixel * 4;
+        const key = (data[i] << 16) + (data[i + 1] << 8) + data[i + 2];
+        let order = orderByColour.get(key);
+        if (order === undefined) {
+          order = randomOrder();
+          orderByColour.set(key, order);
+        }
+        individual[pixel] = order;
+      }
+      return individual;
+    }
+    const seed = seeds[Math.floor(Math.random() * seeds.length)];
+    return mutate(seed, Math.random() < 0.4);
+  }
+
+  // GAConverter::cFun -- split the image at a random point and take each of the
+  // four quadrants from either parent.
+  function crossover(parentA, parentB) {
+    const splitRow = 1 + Math.floor(Math.random() * (height - 3));
+    const splitCol = 1 + Math.floor(Math.random() * (width - 3));
+    const parents = [parentA, parentB];
+    const children = [new Uint8Array(pixelCount), new Uint8Array(pixelCount)];
+    for (let c = 0; c < 2; c++) {
+      const child = children[c];
+      const topLeft = parents[Math.random() < 0.5 ? 0 : 1];
+      const topRight = parents[Math.random() < 0.5 ? 0 : 1];
+      const bottomLeft = parents[Math.random() < 0.5 ? 0 : 1];
+      const bottomRight = parents[Math.random() < 0.5 ? 0 : 1];
+      for (let y = 0; y < height; y++) {
+        const rowBase = y * width;
+        const left = y < splitRow ? topLeft : bottomLeft;
+        const right = y < splitRow ? topRight : bottomRight;
+        for (let x = 0; x < splitCol; x++) {
+          child[rowBase + x] = left[rowBase + x];
+        }
+        for (let x = splitCol; x < width; x++) {
+          child[rowBase + x] = right[rowBase + x];
+        }
+      }
+    }
+    return children;
+  }
+
+  // --- the GA itself (heu::SOGA, tournament selection, elitism) ------------
+  let population = [];
+  for (let i = 0; i < GA_POPULATION_SIZE; i++) {
+    const genome = createIndividual();
+    population.push({ genome: genome, fitness: fitness(genome) });
+  }
+
+  function tournamentPick(pool) {
+    let best = pool[Math.floor(Math.random() * pool.length)];
+    for (let t = 1; t < GA_TOURNAMENT_SIZE; t++) {
+      const challenger = pool[Math.floor(Math.random() * pool.length)];
+      if (challenger.fitness < best.fitness) {
+        best = challenger;
+      }
+    }
+    return best;
+  }
+
+  let bestEver = population[0];
+  for (const individual of population) {
+    if (individual.fitness < bestEver.fitness) {
+      bestEver = individual;
+    }
+  }
+
+  let failTimes = 0;
+  for (let generation = 0; generation < GA_MAX_GENERATIONS; generation++) {
+    postMessage({
+      head: "PROGRESS_REPORT",
+      body: generation / GA_MAX_GENERATIONS,
+    });
+
+    const offspring = [];
+    for (let pair = 0; pair < GA_POPULATION_SIZE / 2; pair++) {
+      if (Math.random() >= GA_CROSSOVER_PROB) {
+        continue;
+      }
+      const children = crossover(tournamentPick(population).genome, tournamentPick(population).genome);
+      offspring.push({ genome: children[0], fitness: 0 }, { genome: children[1], fitness: 0 });
+    }
+
+    // GAConverter::__impl_recordFitness: mutation is strong for the first half
+    // of the run, then weak, so the search coarsens early and refines late.
+    const strongMutation = generation * 2 < GA_MAX_GENERATIONS;
+    for (const individual of population) {
+      if (Math.random() < GA_MUTATION_PROB) {
+        offspring.push({ genome: mutate(individual.genome, strongMutation), fitness: 0 });
+      }
+    }
+
+    for (const individual of offspring) {
+      individual.fitness = fitness(individual.genome);
+    }
+
+    const pool = population.concat(offspring);
+    let generationBest = pool[0];
+    for (const individual of pool) {
+      if (individual.fitness < generationBest.fitness) {
+        generationBest = individual;
+      }
+    }
+
+    const survivors = [generationBest]; // elitism
+    while (survivors.length < GA_POPULATION_SIZE) {
+      survivors.push(tournamentPick(pool));
+    }
+    population = survivors;
+
+    if (generationBest.fitness < bestEver.fitness) {
+      bestEver = generationBest;
+      failTimes = 0;
+    } else {
+      failTimes++;
+      if (failTimes >= GA_MAX_FAIL_TIMES) {
+        break;
+      }
+    }
+  }
+
+  // --- write the winner back (GAConverter::resultImage) --------------------
+  const best = bestEver.genome;
+  for (let pixel = 0; pixel < pixelCount; pixel++) {
+    if (!opaque[pixel]) {
+      continue;
+    }
+    const rgb = paletteEntries[candidates[pixel * GA_ORDER_MAX + best[pixel]]].rgb;
+    const i = pixel * 4;
+    data[i] = rgb[0];
+    data[i + 1] = rgb[1];
+    data[i + 2] = rgb[2];
+  }
+
+  // MapImageCvter::convert_image feeds the GA result back through the normal
+  // conversion, so that the dither setting still applies. The image is already
+  // made of palette colours, so with dithering off this pass is exact.
+  quantiseImage();
+}
+
 onmessage = (e) => {
   coloursJSON = e.data.body.coloursJSON;
   MapModes = e.data.body.MapModes;
@@ -919,6 +1472,7 @@ onmessage = (e) => {
   optionValue_dithering_propagation_blue = e.data.body.optionValue_dithering_propagation_blue;
 
   setupColourSetsToUse();
+  setupPalette();
   setupExactColourCache();
   getMapartImageDataAndMaterials();
   postMessage({

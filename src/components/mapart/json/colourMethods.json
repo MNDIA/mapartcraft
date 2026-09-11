@@ -26,5 +26,9 @@
   "Hct": {
     "uniqueId": 6,
     "name": "HCT (Hue, Chroma, Tone)"
+  },
+  "GaCvter": {
+    "uniqueId": 7,
+    "name": "GA edge-preserving (SlopeCraft port; very slow)"
   }
 }
